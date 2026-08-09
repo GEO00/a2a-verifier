@@ -1,0 +1,16 @@
+# Never bake secrets or local state into the image
+.env
+.env.*
+!.env.example
+*.db
+__pycache__/
+*.pyc
+
+# Tests and docs are not needed at runtime
+test_*.py
+run_test.py
+run_stdlib_test.py
+test_client.py
+server_stdlib.py
+*.md
+scripts/

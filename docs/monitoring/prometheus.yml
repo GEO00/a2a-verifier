@@ -1,0 +1,36 @@
+# Prometheus scrape config for base-a2a-verifier
+# Merge the scrape_configs entry into your existing prometheus.yml.
+scrape_configs:
+  - job_name: base-a2a-verifier
+    metrics_path: /metrics
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    scheme: https
+    static_configs:
+      - targets:
+          # Replace with the deployed hostname (no scheme, no path)
+          - <your-app>.up.railway.app
+        labels:
+          service: base-a2a-verifier
+          network: base-mainnet
+
+# Suggested alert rules (drop into a rules file):
+#
+# groups:
+#   - name: base-a2a-verifier
+#     rules:
+#       - alert: VerifierHighP99Latency
+#         expr: histogram_quantile(0.99, rate(simulation_latency_seconds_bucket[5m])) > 3.0
+#         for: 5m
+#         annotations:
+#           summary: "p99 simulation latency above 3.0s SLA"
+#       - alert: VerifierRpcErrors
+#         expr: rate(rpc_errors_total[5m]) > 0.1
+#         for: 5m
+#         annotations:
+#           summary: "Sustained RPC errors -- check BASE_RPC_URLS endpoints"
+#       - alert: VerifierDown
+#         expr: up{job="base-a2a-verifier"} == 0
+#         for: 2m
+#         annotations:
+#           summary: "Verifier /metrics unreachable"

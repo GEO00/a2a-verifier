@@ -1,0 +1,28 @@
+# Railway deployment config for base-a2a-verifier
+#
+# REQUIRED manual setup in the Railway dashboard:
+#   1. Service variables (Settings -> Variables):
+#        PRODUCTION_MODE=true
+#        ALLOW_TEST_PAYMENT_PROOFS=false
+#        PAYMENT_WALLET_ADDRESS=0x1D1173c1465c9a01F6AfA38B36cc1125CC55C71a
+#        BASE_RPC_URLS=https://mainnet.base.org,https://base.publicnode.com
+#        PROOF_DB_PATH=/data/used_proofs.db
+#        PORT=8000
+#      (Prepend a private Alchemy/QuickNode endpoint to BASE_RPC_URLS when available.
+#       Store it as a Railway variable only -- never commit it.)
+#   2. Volume (Settings -> Volumes): mount a volume at /data
+#      This persists the SQLite replay-protection DB across deploys.
+#      WITHOUT THIS VOLUME, USED PAYMENT PROOFS RESET ON EVERY DEPLOY (double-spend risk).
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1"
+healthcheckPath = "/health"
+healthcheckTimeout = 60
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+# numReplicas must stay 1 while replay protection is SQLite-backed.
+numReplicas = 1

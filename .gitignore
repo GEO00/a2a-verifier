@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+/tmp/
+used_proofs.db
+*.db
+.mypy_cache/
+.ruff_cache/
