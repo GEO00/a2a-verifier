@@ -48,6 +48,8 @@ AERODROME_FACTORY = "0x420DD381b31aEf6683db6b902084cB0FFECe40Da"
 
 # EIP-1967 Proxy Storage Slot & Null Address Constants
 EIP1967_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+# Legacy ZeppelinOS slot: keccak("org.zeppelinos.proxy.implementation") — used by e.g. USDC (FiatTokenProxy)
+ZOS_IMPLEMENTATION_SLOT = "0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 DEAD_ADDRESS = "0x000000000000000000000000000000000000dead"
 
@@ -279,10 +281,19 @@ class EVMTokenSimulator:
                 if resp.status_code == 200:
                     data = resp.json()
                     if "error" in data:
-                        logger.debug(f"RPC Error ({method}) on {rpc_url}: {data['error']}")
-                        return None
+                        err = data["error"]
+                        msg = str(err.get("message", "")).lower()
+                        # Execution reverts are a definitive on-chain answer.
+                        # Anything else (rate limit, invalid params, node
+                        # hiccup) is a transport failure: try the next RPC.
+                        if err.get("code") == 3 or "revert" in msg:
+                            return None
+                        self.rpc_errors_total += 1
+                        logger.warning(f"RPC transient error ({method}) on {rpc_url}: {err}")
+                        continue
                     return data.get("result")
                 else:
+                    self.rpc_errors_total += 1
                     logger.warning(f"RPC HTTP {resp.status_code} from {rpc_url}")
             except Exception as e:
                 self.rpc_errors_total += 1
@@ -310,14 +321,14 @@ class EVMTokenSimulator:
             params.append(state_override)
         return await self._rpc_call("eth_call", params, timeout=timeout)
 
-    async def _detect_dex_routing(self, token_address: str) -> tuple[bool, str, int]:
+    async def _detect_dex_routing(self, token_address: str) -> tuple[bool, str, int, bool]:
         """
         Parallelized On-Chain DEX Detection via asyncio.gather:
         1-3: Uniswap V3 Factory (0x33128a8fC17869897dcE68Ed026d694621f6FDfD) getPool(token, WETH, fee) for fees [500, 3000, 10000]
         4: Aerodrome Volatile Pool getPool(token, WETH, false)
         5: Aerodrome Stable Pool getPool(token, WETH, true)
         6: Aerodrome V2 Fallback getPair(token, WETH)
-        Returns: (is_v3, router_to_use, v3_fee)
+        Returns: (is_v3, router_to_use, v3_fee, aero_stable)
         """
         token_clean = token_address.lower()
         token_padded = token_clean[2:].zfill(64)
@@ -352,24 +363,24 @@ class EVMTokenSimulator:
             if res and isinstance(res, str) and len(res) >= 66:
                 pool_addr = "0x" + res[-40:].lower()
                 if pool_addr != ZERO_ADDRESS:
-                    return True, UNISWAP_V3_ROUTER, fee
+                    return True, UNISWAP_V3_ROUTER, fee, False
 
         # Check Aerodrome Volatile (idx 3) and Stable (idx 4)
-        for idx in (3, 4):
+        for idx, stable in ((3, False), (4, True)):
             res = results[idx]
             if res and isinstance(res, str) and len(res) >= 66:
                 pool_addr = "0x" + res[-40:].lower()
                 if pool_addr != ZERO_ADDRESS:
-                    return False, AERODROME_ROUTER, 0
+                    return False, AERODROME_ROUTER, 0, stable
 
         # Check V2 fallback getPair (idx 5)
         res_v2 = results[5]
         if res_v2 and isinstance(res_v2, str) and len(res_v2) >= 66:
             pool_addr = "0x" + res_v2[-40:].lower()
             if pool_addr != ZERO_ADDRESS:
-                return False, AERODROME_ROUTER, 0
+                return False, AERODROME_ROUTER, 0, False
 
-        return False, AERODROME_ROUTER, 0
+        return False, AERODROME_ROUTER, 0, False
 
     async def _smart_storage_override(self, token_address: str, router_address: str) -> tuple[dict[str, Any], bool]:
         """
@@ -380,10 +391,18 @@ class EVMTokenSimulator:
         """
         wallet_padded = SIMULATION_WALLET[2:].zfill(64)
         bal_calldata = "0x70a08231" + wallet_padded
-        max_uint256 = "0x" + "f" * 64
+        # Top bit intentionally clear (2^255 - 1): tokens like USDC v2.2 pack a
+        # blacklist flag into the balance slot's MSB; setting it would make the
+        # override wallet appear blacklisted and revert every sell.
+        max_uint256 = "0x7" + "f" * 63
         probed_slots = [0, 1, 2, 3, 5, 6, 9]
 
-        # Concurrently probe candidate slots
+        # Concurrently probe candidate slots. The wallet may hold a real
+        # pre-existing balance (0x1111...1111 is a common burn address), so a
+        # slot only counts as discovered if balanceOf reflects the huge
+        # override value itself, not merely any non-zero balance.
+        override_threshold = 1 << 200
+
         async def _probe_slot(slot: int) -> tuple[int, bool]:
             bal_slot = _compute_storage_slot(SIMULATION_WALLET, slot)
             override = {
@@ -395,7 +414,7 @@ class EVMTokenSimulator:
             if res and isinstance(res, str) and len(res) >= 66:
                 try:
                     val = int(res[2:66], 16)
-                    if val > 0:
+                    if val >= override_threshold:
                         return slot, True
                 except Exception:
                     pass
@@ -441,132 +460,127 @@ class EVMTokenSimulator:
         }
         return state_override, layout_discovered
 
-    def _build_v2_buy_data(self, token_address: str, wallet_address: str = SIMULATION_WALLET) -> str:
-        """Aerodrome / Uniswap V2 Router swapExactETHForTokens (0x7ff36ab5)."""
-        token_padded = token_address[2:].zfill(64)
-        weth_padded = WETH_BASE[2:].zfill(64)
-        wallet_padded = wallet_address[2:].zfill(64)
+    @staticmethod
+    def _abi_word(value: "int | str") -> str:
+        """Encode an int or 0x-hex string as one 64-char ABI word (prevents odd-length hex)."""
+        if isinstance(value, int):
+            word = hex(value)[2:]
+        else:
+            word = value.removeprefix("0x")
+        if len(word) > 64:
+            raise ValueError(f"ABI word overflow: {word}")
+        return word.zfill(64)
+
+    def _aero_route_tail(self, from_token: str, to_token: str, stable: bool) -> str:
+        """ABI tail for Aerodrome Route[] of length 1: (from, to, stable, factory)."""
+        w = self._abi_word
         return (
-            "0x7ff36ab5"
-            + "0"*64            # amountOutMin = 0
-            + "0"*63 + "80"    # offset to path array = 128 (0x80)
-            + wallet_padded    # to
-            + "f"*64            # deadline = max uint
-            + "0"*63 + "2"     # path len = 2
-            + weth_padded      # path[0] = WETH
-            + token_padded     # path[1] = Token
+            w(1)                    # routes array length
+            + w(from_token)
+            + w(to_token)
+            + w(1 if stable else 0)
+            + w(AERODROME_FACTORY)
         )
 
-    def _build_v2_sell_data(self, token_address: str, sell_amount: int, wallet_address: str = SIMULATION_WALLET) -> str:
-        """Aerodrome / Uniswap V2 Router swapExactTokensForETH (0x18cbafe5)."""
-        token_padded = token_address[2:].zfill(64)
-        weth_padded = WETH_BASE[2:].zfill(64)
-        wallet_padded = wallet_address[2:].zfill(64)
-        sell_amount_hex = hex(sell_amount)[2:].zfill(64)
+    def _build_v2_buy_data(self, token_address: str, stable: bool = False, wallet_address: str = SIMULATION_WALLET) -> str:
+        """Aerodrome Router swapExactETHForTokens(uint256,Route[],address,uint256) (0x903638a4)."""
+        w = self._abi_word
         return (
-            "0x18cbafe5"
-            + sell_amount_hex  # amountIn
-            + "0"*64          # amountOutMin = 0
-            + "0"*63 + "a0"  # offset to path array = 160 (0xa0)
-            + wallet_padded  # to
-            + "f"*64          # deadline = max uint
-            + "0"*63 + "2"   # path len = 2
-            + token_padded   # path[0] = Token
-            + weth_padded    # path[1] = WETH
+            "0x903638a4"
+            + w(0)                  # amountOutMin = 0
+            + w(0x80)               # offset to routes array
+            + w(wallet_address)     # to
+            + "f" * 64              # deadline = max uint
+            + self._aero_route_tail(WETH_BASE, token_address, stable)
         )
 
-    def _build_v2_sell_quote_data(self, token_address: str, sell_amount: int) -> str:
-        """Aerodrome / Uniswap V2 Router getAmountsOut (0xd0679dd2) for sell_amount."""
-        token_padded = token_address[2:].zfill(64)
-        weth_padded = WETH_BASE[2:].zfill(64)
-        sell_amount_hex = hex(sell_amount)[2:].zfill(64)
+    def _build_v2_sell_data(self, token_address: str, sell_amount: int, stable: bool = False, wallet_address: str = SIMULATION_WALLET) -> str:
+        """Aerodrome Router swapExactTokensForETH(uint256,uint256,Route[],address,uint256) (0xc6b7f1b6)."""
+        w = self._abi_word
         return (
-            "0xd0679dd2"
-            + sell_amount_hex  # amountIn
-            + "0"*63 + "40"    # offset to path = 64 (0x40)
-            + "0"*63 + "2"     # path len = 2
-            + token_padded     # path[0] = Token
-            + weth_padded      # path[1] = WETH
+            "0xc6b7f1b6"
+            + w(sell_amount)        # amountIn
+            + w(0)                  # amountOutMin = 0
+            + w(0xa0)               # offset to routes array
+            + w(wallet_address)     # to
+            + "f" * 64              # deadline = max uint
+            + self._aero_route_tail(token_address, WETH_BASE, stable)
         )
+
+    def _build_v2_buy_quote_data(self, token_address: str, stable: bool = False) -> str:
+        """Aerodrome Router getAmountsOut(uint256,Route[]) (0x5509a1ac) for WETH -> Token."""
+        w = self._abi_word
+        return (
+            "0x5509a1ac"
+            + w(10**15)             # amountIn = 0.001 ETH
+            + w(0x40)               # offset to routes array
+            + self._aero_route_tail(WETH_BASE, token_address, stable)
+        )
+
+    def _build_v2_sell_quote_data(self, token_address: str, sell_amount: int, stable: bool = False) -> str:
+        """Aerodrome Router getAmountsOut(uint256,Route[]) (0x5509a1ac) for Token -> WETH."""
+        w = self._abi_word
+        return (
+            "0x5509a1ac"
+            + w(sell_amount)        # amountIn
+            + w(0x40)               # offset to routes array
+            + self._aero_route_tail(token_address, WETH_BASE, stable)
+        )
+
+    def _encode_v3_path(self, path_hex: str) -> str:
+        """ABI tail (len + right-padded bytes) for a V3 packed path."""
+        path_bytes_len = len(path_hex) // 2
+        padded = path_hex.ljust(64 * ((len(path_hex) + 63) // 64), "0")
+        return self._abi_word(path_bytes_len) + padded
 
     def _build_v3_buy_data(self, token_address: str, fee: int = 3000, wallet_address: str = SIMULATION_WALLET) -> str:
-        """Uniswap V3 Router exactInput (0xc04b8d59) with encoded V3 route bytes for Buy."""
-        fee_hex = hex(fee)[2:].zfill(6)
-        path_hex = WETH_BASE[2:] + fee_hex + token_address[2:]
-        path_bytes_len = len(bytes.fromhex(path_hex))
-        path_len_hex = hex(path_bytes_len)[2:].zfill(64)
-        path_padded = path_hex.ljust(64 * ((len(path_hex) + 63) // 64), '0')
-        
-        wallet_padded = wallet_address[2:].zfill(64)
-        amount_in_hex = hex(10**15)[2:].zfill(64)  # 0.001 ETH
-        
+        """SwapRouter02 exactInput((bytes,address,uint256,uint256)) (0xb858183f) for Buy (no deadline field)."""
+        w = self._abi_word
+        path_hex = WETH_BASE[2:] + hex(fee)[2:].zfill(6) + token_address[2:]
         return (
-            "0xc04b8d59"
-            + "0"*63 + "20"     # offset to struct = 32 (0x20)
-            + "0"*63 + "a0"     # offset to path in struct = 160 (0xa0)
-            + wallet_padded     # recipient
-            + "f"*64             # deadline = max uint
-            + amount_in_hex     # amountIn
-            + "0"*64             # amountOutMinimum = 0
-            + path_len_hex      # path len
-            + path_padded       # path bytes
+            "0xb858183f"
+            + w(0x20)               # offset to params struct
+            + w(0x80)               # offset to path within struct
+            + w(wallet_address)     # recipient
+            + w(10**15)             # amountIn = 0.001 ETH
+            + w(0)                  # amountOutMinimum = 0
+            + self._encode_v3_path(path_hex)
         )
 
     def _build_v3_sell_data(self, token_address: str, sell_amount: int, fee: int = 3000, wallet_address: str = SIMULATION_WALLET) -> str:
-        """Uniswap V3 Router exactInput (0xc04b8d59) with encoded V3 route bytes for Sell."""
-        fee_hex = hex(fee)[2:].zfill(6)
-        path_hex = token_address[2:] + fee_hex + WETH_BASE[2:]
-        path_bytes_len = len(bytes.fromhex(path_hex))
-        path_len_hex = hex(path_bytes_len)[2:].zfill(64)
-        path_padded = path_hex.ljust(64 * ((len(path_hex) + 63) // 64), '0')
-        
-        wallet_padded = wallet_address[2:].zfill(64)
-        amount_in_hex = hex(sell_amount)[2:].zfill(64)
-        
+        """SwapRouter02 exactInput((bytes,address,uint256,uint256)) (0xb858183f) for Sell (no deadline field)."""
+        w = self._abi_word
+        path_hex = token_address[2:] + hex(fee)[2:].zfill(6) + WETH_BASE[2:]
         return (
-            "0xc04b8d59"
-            + "0"*63 + "20"
-            + "0"*63 + "a0"
-            + wallet_padded
-            + "f"*64
-            + amount_in_hex
-            + "0"*64
-            + path_len_hex
-            + path_padded
+            "0xb858183f"
+            + w(0x20)
+            + w(0x80)
+            + w(wallet_address)
+            + w(sell_amount)
+            + w(0)
+            + self._encode_v3_path(path_hex)
         )
 
     def _build_v3_quoter_data(self, token_address: str, fee: int = 3000) -> str:
-        """Uniswap V3 Quoter quoteExactInput (0xcdca1753) for spot pricing (WETH -> Token)."""
-        fee_hex = hex(fee)[2:].zfill(6)
-        path_hex = WETH_BASE[2:] + fee_hex + token_address[2:]
-        path_bytes_len = len(bytes.fromhex(path_hex))
-        path_len_hex = hex(path_bytes_len)[2:].zfill(64)
-        path_padded = path_hex.ljust(64 * ((len(path_hex) + 63) // 64), '0')
-        amount_in_hex = hex(10**15)[2:].zfill(64)
-        
+        """QuoterV2 quoteExactInput(bytes,uint256) (0xcdca1753) for spot pricing (WETH -> Token)."""
+        w = self._abi_word
+        path_hex = WETH_BASE[2:] + hex(fee)[2:].zfill(6) + token_address[2:]
         return (
             "0xcdca1753"
-            + "0"*63 + "40"    # offset to path = 64 (0x40)
-            + amount_in_hex    # amountIn
-            + path_len_hex     # path len
-            + path_padded      # path bytes
+            + w(0x40)               # offset to path bytes
+            + w(10**15)             # amountIn = 0.001 ETH
+            + self._encode_v3_path(path_hex)
         )
 
     def _build_v3_sell_quoter_data(self, token_address: str, sell_amount: int, fee: int = 3000) -> str:
-        """Uniswap V3 Quoter quoteExactInput (0xcdca1753) for Token -> WETH sell pricing."""
-        fee_hex = hex(fee)[2:].zfill(6)
-        path_hex = token_address[2:] + fee_hex + WETH_BASE[2:]
-        path_bytes_len = len(bytes.fromhex(path_hex))
-        path_len_hex = hex(path_bytes_len)[2:].zfill(64)
-        path_padded = path_hex.ljust(64 * ((len(path_hex) + 63) // 64), '0')
-        amount_in_hex = hex(sell_amount)[2:].zfill(64)
-
+        """QuoterV2 quoteExactInput(bytes,uint256) (0xcdca1753) for Token -> WETH sell pricing."""
+        w = self._abi_word
+        path_hex = token_address[2:] + hex(fee)[2:].zfill(6) + WETH_BASE[2:]
         return (
             "0xcdca1753"
-            + "0"*63 + "40"
-            + amount_in_hex
-            + path_len_hex
-            + path_padded
+            + w(0x40)
+            + w(sell_amount)
+            + self._encode_v3_path(path_hex)
         )
 
     async def _inspect_contract(self, token_clean: str) -> dict[str, Any]:
@@ -594,6 +608,7 @@ class EVMTokenSimulator:
                 self._encode_eth_call(token_clean, "0x8da5cb5b", timeout=2.0),
                 self._encode_eth_call(token_clean, "0x893d20e8", timeout=2.0),
                 self._encode_eth_call(token_clean, "0xf851a101", timeout=2.0),
+                self._rpc_call("eth_getStorageAt", [token_clean, ZOS_IMPLEMENTATION_SLOT, "latest"], timeout=2.0),
             ]
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -603,18 +618,21 @@ class EVMTokenSimulator:
             owner_res = results[2] if not isinstance(results[2], Exception) else None
             get_owner_res = results[3] if not isinstance(results[3], Exception) else None
             admin_res = results[4] if not isinstance(results[4], Exception) else None
+            zos_res = results[5] if not isinstance(results[5], Exception) else None
 
             # 1. Bytecode Existence
             has_bytecode = bool(code_res and isinstance(code_res, str) and len(code_res) > 2)
 
-            # 2. EIP-1967 Proxy Resolution
-            if storage_res and isinstance(storage_res, str) and len(storage_res) >= 66:
-                raw_addr = "0x" + storage_res[-40:].lower()
-                if raw_addr != ZERO_ADDRESS:
-                    imp_code = await self._rpc_call("eth_getCode", [raw_addr, "latest"], timeout=2.0)
-                    if imp_code and isinstance(imp_code, str) and len(imp_code) > 2:
-                        is_proxy = True
-                        implementation_address = raw_addr
+            # 2. Proxy Resolution: EIP-1967 slot first, legacy ZeppelinOS slot as fallback
+            for slot_res in (storage_res, zos_res):
+                if slot_res and isinstance(slot_res, str) and len(slot_res) >= 66:
+                    raw_addr = "0x" + slot_res[-40:].lower()
+                    if raw_addr != ZERO_ADDRESS:
+                        imp_code = await self._rpc_call("eth_getCode", [raw_addr, "latest"], timeout=2.0)
+                        if imp_code and isinstance(imp_code, str) and len(imp_code) > 2:
+                            is_proxy = True
+                            implementation_address = raw_addr
+                            break
 
             # 3. Multi-Selector Ownership Checking
             resolved_owner = None
@@ -683,11 +701,12 @@ class EVMTokenSimulator:
             dex_resp = await client.get(dex_url, timeout=1.5)
             if dex_resp.status_code == 200:
                 dex_data = dex_resp.json()
-                pairs = dex_data.get("pairs", [])
+                # Only consider Base-chain pairs; pick the deepest pool.
+                pairs = [p for p in (dex_data.get("pairs") or []) if p.get("chainId") == "base"]
                 if pairs:
-                    top_pair = pairs[0]
-                    liquidity_usd = float(top_pair.get("liquidity", {}).get("usd", 0.0))
-                    volume_24h = float(top_pair.get("volume", {}).get("h24", 0.0))
+                    top_pair = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
+                    liquidity_usd = float((top_pair.get("liquidity") or {}).get("usd", 0.0))
+                    volume_24h = float((top_pair.get("volume") or {}).get("h24", 0.0))
                     pair_address = top_pair.get("pairAddress")
                     dex_id = top_pair.get("dexId", "aerodrome")
         except Exception as e:
@@ -700,27 +719,24 @@ class EVMTokenSimulator:
         effective_sell_tax = 0.0
         unknown_storage_layout = False
 
-        if has_bytecode:
+        if token_clean == WETH_BASE.lower():
+            # WETH is the quote asset itself: it cannot be routed against a
+            # WETH pair. Wrapping/unwrapping is permissionless and untaxed.
+            simulated_buy_success = True
+            simulated_sell_success = True
+        elif has_bytecode:
             # Parallelized On-Chain DEX Factory routing detection
-            is_v3, router_to_use, v3_fee = await self._detect_dex_routing(token_clean)
+            is_v3, router_to_use, v3_fee, aero_stable = await self._detect_dex_routing(token_clean)
 
             # Build Router Calldata according to Router type (V2 vs V3)
             if is_v3:
                 buy_data = self._build_v3_buy_data(token_clean, fee=v3_fee)
                 quote_res = await self._encode_eth_call(UNISWAP_V3_QUOTER, self._build_v3_quoter_data(token_clean, fee=v3_fee), timeout=1.5)
             else:
-                buy_data = self._build_v2_buy_data(token_clean)
-                weth_padded = WETH_BASE[2:].zfill(64)
-                token_padded = token_clean[2:].zfill(64)
-                v2_quote_data = (
-                    "0xd0679dd2"
-                    + "0"*51 + "2386f26fc10000"  # 0.001 ETH
-                    + "0"*63 + "40"
-                    + "0"*63 + "2"
-                    + weth_padded
-                    + token_padded
+                buy_data = self._build_v2_buy_data(token_clean, stable=aero_stable)
+                quote_res = await self._encode_eth_call(
+                    router_to_use, self._build_v2_buy_quote_data(token_clean, stable=aero_stable), timeout=1.5
                 )
-                quote_res = await self._encode_eth_call(router_to_use, v2_quote_data, timeout=1.5)
 
             # Decode Quote using ABI decoding hierarchy
             expected_buy_tokens = 0
@@ -736,8 +752,12 @@ class EVMTokenSimulator:
                     logger.debug(f"Quote ABI decoding exception: {e}")
                     expected_buy_tokens = 0
 
-            # Execute eth_call simulation for Buy
-            buy_res = await self._encode_eth_call(router_to_use, buy_data, value="0x2386f26fc10000", timeout=2.5)
+            # Execute eth_call simulation for Buy (fund the simulation wallet:
+            # some RPCs enforce the sender balance for value-bearing eth_call)
+            buy_override = {SIMULATION_WALLET.lower(): {"balance": "0xDE0B6B3A7640000"}}  # 1 ETH
+            buy_res = await self._encode_eth_call(
+                router_to_use, buy_data, value="0x2386f26fc10000", state_override=buy_override, timeout=2.5
+            )
 
             actual_buy_tokens = 0
             if buy_res and isinstance(buy_res, str) and len(buy_res) >= 66:
@@ -806,7 +826,7 @@ class EVMTokenSimulator:
                         else:
                             sell_quote_res = await self._encode_eth_call(
                                 router_to_use,
-                                self._build_v2_sell_quote_data(token_clean, sell_amount),
+                                self._build_v2_sell_quote_data(token_clean, sell_amount, stable=aero_stable),
                                 timeout=0.8
                             )
                             if sell_quote_res and isinstance(sell_quote_res, str) and len(sell_quote_res) >= 66:
@@ -820,7 +840,7 @@ class EVMTokenSimulator:
                     if is_v3:
                         sell_data = self._build_v3_sell_data(token_clean, sell_amount, fee=v3_fee)
                     else:
-                        sell_data = self._build_v2_sell_data(token_clean, sell_amount)
+                        sell_data = self._build_v2_sell_data(token_clean, sell_amount, stable=aero_stable)
 
                     # Run Sell Simulation
                     sell_res = await self._encode_eth_call(
@@ -872,6 +892,7 @@ class EVMTokenSimulator:
             "buy_tax_deduction": 0.0,
             "sell_tax_deduction": 0.0,
             "high_liquidity_bonus": 0,
+            "low_liquidity_penalty": 0,
             "renounced_bonus": 0,
             "non_proxy_bonus": 0,
             "final_score": 0
@@ -892,6 +913,13 @@ class EVMTokenSimulator:
             if liquidity_usd > 100000:
                 score_val += 5.0
                 score_breakdown["high_liquidity_bonus"] = 5
+            elif liquidity_usd < 1000:
+                # A sellable token in a near-empty pool is still a rug/exit risk.
+                score_val -= 50.0
+                score_breakdown["low_liquidity_penalty"] = -50
+            elif liquidity_usd < 10000:
+                score_val -= 30.0
+                score_breakdown["low_liquidity_penalty"] = -30
             if contract_analysis.get("contract_renounced"):
                 score_val += 10.0
                 score_breakdown["renounced_bonus"] = 10
