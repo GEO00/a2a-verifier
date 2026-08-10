@@ -1,16 +1,13 @@
 # Distribution & Directory Submission Package
 
-> Replace `https://<your-app>.up.railway.app` with the real Railway URL after deploy.
-> All submissions below share the same metadata block.
-
 ## Shared Submission Metadata
 
 | Field | Value |
 |---|---|
-| API endpoint | `https://<your-app>.up.railway.app/verify?token={token_address}` |
-| Schema URL | `https://<your-app>.up.railway.app/schema` |
-| OpenAPI spec | `https://<your-app>.up.railway.app/openapi.json` |
-| Health check | `https://<your-app>.up.railway.app/health` |
+| API endpoint | `https://a2a-verifier-production.up.railway.app/verify?token={token_address}` |
+| Schema URL | `https://a2a-verifier-production.up.railway.app/schema` |
+| OpenAPI spec | `https://a2a-verifier-production.up.railway.app/openapi.json` |
+| Health check | `https://a2a-verifier-production.up.railway.app/health` |
 | Pricing | $0.05 USDC per request (x402, Base mainnet) |
 | Payment wallet | `0x1D1173c1465c9a01F6AfA38B36cc1125CC55C71a` |
 | Description | Base L2 EVM simulation verifier with x402 payment gating |
@@ -49,7 +46,7 @@ priced at $0.05 USDC per call via the x402 protocol.
 > address, get back full buy/sell simulation, honeypot/tax analysis, proxy
 > resolution, and a safety score — $0.05 USDC per query, paid on-chain with
 > replay-protected settlement. Free machine-readable schema for agent discovery:
-> `https://<your-app>.up.railway.app/schema` — feedback welcome!
+> `https://a2a-verifier-production.up.railway.app/schema` — feedback welcome!
 
 ### Web3 AI Agent Forums
 
@@ -60,4 +57,4 @@ priced at $0.05 USDC per call via the x402 protocol.
 > `X-PAYMENT-PROOF` -> receive EVM-simulated buy/sell results, honeypot and
 > transfer-tax detection, proxy/ownership analysis, and a 0-100 safety score.
 > No accounts, no API keys, fully machine-discoverable via `/schema` and OpenAPI.
-> Endpoint: `https://<your-app>.up.railway.app/verify?token=0x...`
+> Endpoint: `https://a2a-verifier-production.up.railway.app/verify?token=0x...`

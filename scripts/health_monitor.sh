@@ -2,7 +2,7 @@
 # Polls GET /health every 30s and alerts on non-200 responses.
 #
 # Usage:
-#   HEALTH_URL=https://<your-app>.up.railway.app/health \
+#   HEALTH_URL=https://a2a-verifier-production.up.railway.app/health \
 #   ALERT_WEBHOOK_URL=https://discord.com/api/webhooks/... \
 #   ./scripts/health_monitor.sh
 #

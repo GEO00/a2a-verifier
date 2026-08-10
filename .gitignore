@@ -6,3 +6,5 @@ used_proofs.db
 *.db
 .mypy_cache/
 .ruff_cache/
+.cursor/
+.railway/

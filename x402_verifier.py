@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import sqlite3
 import time
 from decimal import Decimal
 from typing import Any
@@ -12,7 +13,7 @@ try:
     AIOSQLITE_AVAILABLE = True
 except ImportError:
     AIOSQLITE_AVAILABLE = False
-    import sqlite3
+    aiosqlite = None  # type: ignore[assignment]
 
 try:
     from web3 import AsyncWeb3
@@ -139,24 +140,35 @@ class X402PaymentVerifier:
         token_clean = token_address.strip().lower()
 
         if AIOSQLITE_AVAILABLE:
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    "INSERT OR IGNORE INTO used_proofs (tx_hash, token, amount_usdc, used_at) VALUES (?, ?, ?, ?)",
-                    (tx_clean, token_clean, amount_usdc, now)
-                )
-                await db.commit()
-                return cursor.rowcount > 0
-        else:
-            def _sync_claim():
-                conn = sqlite3.connect(self.db_path)
-                with conn:
-                    cursor = conn.execute(
+            try:
+                async with aiosqlite.connect(self.db_path, timeout=5.0) as db:
+                    await db.execute("PRAGMA busy_timeout=5000")
+                    cursor = await db.execute(
                         "INSERT OR IGNORE INTO used_proofs (tx_hash, token, amount_usdc, used_at) VALUES (?, ?, ?, ?)",
                         (tx_clean, token_clean, amount_usdc, now)
                     )
-                    claimed = cursor.rowcount > 0
-                conn.close()
-                return claimed
+                    await db.commit()
+                    return cursor.rowcount > 0
+            except sqlite3.OperationalError as e:
+                # Contended writers under --workers 1 should be rare; log loudly if they appear.
+                logger.error(f"SQLite lock contention claiming proof {tx_clean[:18]}...: {e}")
+                raise
+        else:
+            def _sync_claim():
+                conn = sqlite3.connect(self.db_path, timeout=5.0)
+                try:
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    with conn:
+                        cursor = conn.execute(
+                            "INSERT OR IGNORE INTO used_proofs (tx_hash, token, amount_usdc, used_at) VALUES (?, ?, ?, ?)",
+                            (tx_clean, token_clean, amount_usdc, now)
+                        )
+                        return cursor.rowcount > 0
+                except sqlite3.OperationalError as e:
+                    logger.error(f"SQLite lock contention claiming proof {tx_clean[:18]}...: {e}")
+                    raise
+                finally:
+                    conn.close()
             return await asyncio.to_thread(_sync_claim)
 
     def _get_next_rpc_url(self) -> str:

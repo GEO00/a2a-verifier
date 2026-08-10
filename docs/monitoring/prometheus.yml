@@ -8,8 +8,7 @@ scrape_configs:
     scheme: https
     static_configs:
       - targets:
-          # Replace with the deployed hostname (no scheme, no path)
-          - <your-app>.up.railway.app
+          - a2a-verifier-production.up.railway.app
         labels:
           service: base-a2a-verifier
           network: base-mainnet
