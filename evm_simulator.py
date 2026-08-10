@@ -883,7 +883,14 @@ class EVMTokenSimulator:
             effective_sell_tax = 99.0
 
         # Honeypot vs High Tax Classification Rules
-        is_honeypot = not simulated_sell_success  # True only if sell simulation reverts/fails
+        # A sell failure in a near-empty pool is usually a depth artifact, not a
+        # contract-level sell block: classify as HIGH_RISK rather than HONEYPOT.
+        thin_pool_sell_failure = (
+            simulated_buy_success
+            and not simulated_sell_success
+            and liquidity_usd < 10000
+        )
+        is_honeypot = not simulated_sell_success and not thin_pool_sell_failure
         is_high_tax = effective_sell_tax > 10.0
 
         # Empirical Safety Score & Score Breakdown
@@ -915,11 +922,12 @@ class EVMTokenSimulator:
                 score_breakdown["high_liquidity_bonus"] = 5
             elif liquidity_usd < 1000:
                 # A sellable token in a near-empty pool is still a rug/exit risk.
-                score_val -= 50.0
-                score_breakdown["low_liquidity_penalty"] = -50
+                # Penalties sized so max bonuses (+15) cannot reach the SAFE tier (80).
+                score_val -= 60.0
+                score_breakdown["low_liquidity_penalty"] = -60
             elif liquidity_usd < 10000:
-                score_val -= 30.0
-                score_breakdown["low_liquidity_penalty"] = -30
+                score_val -= 40.0
+                score_breakdown["low_liquidity_penalty"] = -40
             if contract_analysis.get("contract_renounced"):
                 score_val += 10.0
                 score_breakdown["renounced_bonus"] = 10
@@ -933,6 +941,9 @@ class EVMTokenSimulator:
         # Recommendation Tiering
         if is_honeypot:
             recommendation = "HONEYPOT"
+        elif thin_pool_sell_failure:
+            # Tax figure is an artifact of the failed sell; don't report HIGH_TAX.
+            recommendation = "HIGH_RISK"
         elif is_high_tax:
             recommendation = "HIGH_TAX"
         elif score >= 80:
