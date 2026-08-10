@@ -5,9 +5,10 @@
 #        PRODUCTION_MODE=true
 #        ALLOW_TEST_PAYMENT_PROOFS=false
 #        PAYMENT_WALLET_ADDRESS=0x1D1173c1465c9a01F6AfA38B36cc1125CC55C71a
-#        BASE_RPC_URLS=https://mainnet.base.org,https://base.publicnode.com
+#        BASE_RPC_URLS=https://mainnet.base.org,https://base.publicnode.com,https://base.llamarpc.com,https://base.drpc.org
 #        PROOF_DB_PATH=/data/used_proofs.db
 #        PORT=8000
+#        WEB_CONCURRENCY=1
 #      (Prepend a private Alchemy/QuickNode endpoint to BASE_RPC_URLS when available.
 #       Store it as a Railway variable only -- never commit it.)
 #   2. Volume (Settings -> Volumes): mount a volume at /data
