@@ -6,3 +6,8 @@ pydantic>=2.0.0
 python-dotenv>=1.0.0
 eth-abi>=4.0.0
 aiosqlite>=0.19.0
+# x402 v2 + CDP Facilitator (Bazaar discovery)
+# extensions extra pulls jsonschema (required by x402.extensions.bazaar)
+x402[fastapi,evm,extensions]>=2.18.0
+cdp-sdk>=1.47.0
+jsonschema>=4.0.0

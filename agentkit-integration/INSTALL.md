@@ -42,6 +42,15 @@ Add to `__all__`:
 
 Add the same symbols to the top-level package exports (mirror how `x402_action_provider` is exported).
 
+## Dependencies
+
+AgentKit eagerly imports its Solana wallet provider, which still uses the sync
+`solana.rpc.api.Client` API. Pin Solana below 0.40 (0.40+ removed that module):
+
+```bash
+pip install 'solana>=0.36.6,<0.40'
+```
+
 ## Service details (correct values)
 
 | Field | Value |

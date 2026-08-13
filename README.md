@@ -24,7 +24,7 @@ cp .env.example .env   # then edit
 python3 -m uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
-> **Critical:** Always use `--workers 1`. Replay protection is SQLite-backed; multiple workers can race on `used_proofs.db`.
+> **Critical:** Set `CDP_API_KEY_ID` and `CDP_API_KEY_SECRET` (required for CDP Facilitator auth). Prefer `--workers 1`.
 
 ### Tests
 
@@ -37,14 +37,56 @@ python3 scripts/race_test.py direct
 
 ---
 
-## x402 protocol flow (schema 1.1)
+## x402 v2 protocol flow (CDP Facilitator + Bazaar)
 
-1. **Unpaid:** `GET /verify?token=0x...` → `HTTP 402` with `X-402-Price`, `X-402-PayTo`, free metric preview.
-2. **Pay:** send ≥ 0.05 USDC on Base to the payment wallet.
-3. **Settle:** same request with header `X-PAYMENT-PROOF: <tx_hash>` → `HTTP 200` full simulation.
-4. **Replay:** reusing the same tx hash → `HTTP 402` `"Transaction hash already used"`.
+1. **Unpaid:** `GET /verify?token=0x...` → `HTTP 402` with a base64 `PAYMENT-REQUIRED` header
+   (`x402Version: 2`, `accepts[]`, `extensions.bazaar`).
+2. **Pay:** client signs an EIP-3009 USDC authorization for `$0.05` on Base (`eip155:8453`)
+   to `PAYMENT_WALLET_ADDRESS` (via an x402-compatible wallet/client).
+3. **Settle:** retry with `PAYMENT-SIGNATURE: <base64 payment payload>`. Middleware verifies+settles
+   through the **CDP Facilitator** (`https://api.cdp.coinbase.com/platform/v2/x402`), then returns
+   the full EVM simulation.
+4. **Discovery:** `extensions.bazaar` (via `declare_discovery_extension`) makes the route eligible
+   for CDP Bazaar indexing after the first successful verify+settle.
 
-Test proofs (`test_proof_*`) are rejected when `PRODUCTION_MODE=true`.
+Validate with:
+
+```bash
+curl -X POST https://api.cdp.coinbase.com/platform/v2/x402/validate \
+  -H "Content-Type: application/json" \
+  -d '{"resource":"https://a2a-verifier-production.up.railway.app/verify","method":"GET"}'
+```
+
+### Pay with Agentic Wallet (recommended payer)
+
+Buyers/agents should pay from a wallet that is **not** `PAYMENT_WALLET_ADDRESS`
+(CDP rejects self-send). Use [Agentic Wallet CLI](https://docs.cdp.coinbase.com/agentic-wallet/cli/quickstart)
+(`awal`) — requires **Node.js 24+**.
+
+```bash
+# one-time: install agent skills into this repo
+npx skills add coinbase/agentic-wallet-skills
+
+# 1) Auth (email OTP — interactive)
+npx awal@latest auth login you@example.com
+npx awal@latest auth verify <flowId> <6-digit-otp>
+
+# 2) Confirm + fund USDC on Base (Onramp UI, or transfer USDC to the address)
+npx awal@latest status
+npx awal@latest address          # must != 0x1D1173… merchant
+npx awal@latest show             # Fund button / onramp
+npx awal@latest balance --chain base
+
+# 3) Paid call to this service ($0.05)
+./scripts/pay_with_awal.sh
+# or:
+npx awal@latest x402 pay \
+  'https://a2a-verifier-production.up.railway.app/verify?token=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' \
+  --max-amount 60000 --json
+```
+
+Optional for Cursor/Claude Desktop: [Agentic Wallet MCP](https://docs.cdp.coinbase.com/agentic-wallet/mcp/quickstart)
+via `npx @coinbase/payments-mcp` (set spending limits in the wallet UI).
 
 ---
 
@@ -63,15 +105,15 @@ railway link --project reliable-surprise --environment production --service a2a-
 
 railway variable set \
   PRODUCTION_MODE=true \
-  ALLOW_TEST_PAYMENT_PROOFS=false \
   PAYMENT_WALLET_ADDRESS=0x1D1173c1465c9a01F6AfA38B36cc1125CC55C71a \
   BASE_RPC_URLS=https://mainnet.base.org,https://base.publicnode.com,https://base.llamarpc.com,https://base.drpc.org \
-  PROOF_DB_PATH=/data/used_proofs.db \
   PORT=8000 \
   WEB_CONCURRENCY=1 \
   --skip-deploys
 
-railway volume add --mount-path /data   # REQUIRED — without this, proofs reset on redeploy
+# Set CDP keys from the dashboard (do not paste secrets into shell history):
+# CDP_API_KEY_ID / CDP_API_KEY_SECRET
+
 railway up --detach
 railway domain
 ```
@@ -82,11 +124,12 @@ Or: `bash scripts/deploy_railway.sh`
 
 | Variable | Value |
 |---|---|
+| `CDP_API_KEY_ID` | CDP portal API key id |
+| `CDP_API_KEY_SECRET` | CDP portal API key secret |
 | `PRODUCTION_MODE` | `true` |
-| `ALLOW_TEST_PAYMENT_PROOFS` | `false` |
-| `PAYMENT_WALLET_ADDRESS` | your Base wallet |
+| `PAYMENT_WALLET_ADDRESS` | your Base wallet (receives USDC) |
 | `BASE_RPC_URLS` | comma-separated RPCs (prepend a private Alchemy/QuickNode URL when you have one) |
-| `PROOF_DB_PATH` | `/data/used_proofs.db` |
+| `USDC_PRICE` | `0.05` (optional) |
 | `PORT` | `8000` |
 | `WEB_CONCURRENCY` | `1` |
 
@@ -116,9 +159,9 @@ Suggested alerts: p99 simulation latency > 3s, sustained `rpc_errors_total`, scr
 |---|---|---|
 | `Application not found` 404 | Wrong hostname | Use `https://a2a-verifier-production.up.railway.app` (service domain, not project name) |
 | Every token is `HONEYPOT` | Bad RPC / rate limits / old image | Confirm latest deploy; prepend a private RPC to `BASE_RPC_URLS` |
-| `Test payment proofs strictly disabled` | Expected in prod | Use a real Base USDC tx hash |
-| `Transaction hash already used` | Replay protection working | Pay again with a new tx |
-| SQLite / proof DB resets after deploy | Missing volume | `railway volume add --mount-path /data` and `PROOF_DB_PATH=/data/used_proofs.db` |
+| `CDP_API_KEY_ID and CDP_API_KEY_SECRET are required` | Missing facilitator auth | Set both vars from https://portal.cdp.coinbase.com |
+| `Facilitator get_supported failed (401)` | Bad/missing CDP keys | Rotate keys; confirm they are set on the Railway service |
+| Validator: `x402Version is <nil>` | Still on custom/v1 402 body | Deploy this x402 v2 middleware build |
 | `EACCES` on `npm i -g @railway/cli` | Global npm needs root | Use `curl -fsSL https://railway.com/install.sh \| sh` |
 | `railway: command not found` after install | PATH not loaded | `source "$HOME/.railway/env"` |
 

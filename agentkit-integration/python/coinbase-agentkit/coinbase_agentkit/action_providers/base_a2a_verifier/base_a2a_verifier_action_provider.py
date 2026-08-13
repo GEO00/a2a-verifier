@@ -1,9 +1,10 @@
-"""AgentKit action provider for the Base A2A EVM token verifier (x402 tx-hash flow).
+"""AgentKit action provider for the Base A2A EVM token verifier.
 
-This service uses a custom settlement header:
-  X-PAYMENT-PROOF: <base_usdc_transfer_tx_hash>
-
-It is NOT the stock AgentKit x402 facilitator flow (PAYMENT-REQUIRED / x402 SDK).
+NOTE (x402 v2): The production verifier now uses the stock x402 v2 flow
+(PAYMENT-REQUIRED / PAYMENT-SIGNATURE + CDP Facilitator), not the legacy
+custom ``X-PAYMENT-PROOF: <tx_hash>`` settlement path this provider was
+written for. Update callers to an x402-compatible client (or AgentKit's
+x402 action provider) before relying on auto-pay against production.
 """
 
 from __future__ import annotations

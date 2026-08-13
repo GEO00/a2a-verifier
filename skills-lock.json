@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "agentic-wallet": {
+      "source": "coinbase/agentic-wallet-skills",
+      "sourceType": "github",
+      "skillPath": "skills/agentic-wallet/SKILL.md",
+      "computedHash": "c8b76dcdbc732fa27fcd61c212103cb6f9884500963986cb69db6dc5e441a984"
+    }
+  }
+}

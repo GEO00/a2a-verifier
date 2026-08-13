@@ -11,7 +11,7 @@
 | Pricing | $0.05 USDC per request (x402, Base mainnet) |
 | Payment wallet | `0x1D1173c1465c9a01F6AfA38B36cc1125CC55C71a` |
 | Description | Base L2 EVM simulation verifier with x402 payment gating |
-| Protocol | x402 (HTTP 402 challenge / `X-PAYMENT-PROOF` settlement) |
+| Protocol | x402 v2 (HTTP 402 + `PAYMENT-REQUIRED` / `PAYMENT-SIGNATURE`, CDP Facilitator) |
 | Rate limits | 10 unpaid + 30 paid requests/min per IP |
 
 ## 1. Coinbase AgentKit Action Provider Directory
